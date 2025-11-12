@@ -1,0 +1,8 @@
+langgraph
+langchain
+langchain-google-genai
+python-telegram-bot
+yfinance
+textblob
+requests
+python-dotenv
