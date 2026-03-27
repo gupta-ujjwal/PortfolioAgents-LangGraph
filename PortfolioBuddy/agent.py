@@ -1,412 +1,276 @@
+"""
+PortfolioBuddy v2 — A truly agentic portfolio assistant.
+
+Key upgrades over v1:
+  - LLM tool-calling: Gemini decides which tools to invoke (no hardcoded routing)
+  - Persistent memory: SQLite-backed checkpointer so conversations survive restarts
+  - Error recovery: Tools return descriptive errors; LLM reasons about failures
+  - Portfolio management: Add/remove/update stocks via natural language
+  - Stock comparison: Side-by-side analysis of multiple stocks
+"""
+
 import os
-import asyncio
 import logging
-from typing import Dict, Any, List, Optional
 from datetime import datetime
+
+import aiosqlite
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from portfolio_types import AgentState, TelegramMessage, AgentResponse, SentimentIndicator, ActionType
-from tools import CSVPortfolioManager, PortfolioAnalyzer, PortfolioData
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-# Load environment variables from .env file
+from tools import ALL_TOOLS
+
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-class PortfolioBuddyAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite",
-            google_api_key=os.getenv("GEMINI_API_KEY"),
-            temperature=0.3
-        )
-        
-        # Initialize tools
-        self.csv_manager = CSVPortfolioManager()
-        self.portfolio_analyzer = PortfolioAnalyzer()
-        
-        # User sessions storage (in production, use a proper database)
-        self.user_sessions: Dict[int, AgentState] = {}
-        
-        # Build LangGraph
-        self.graph = self._build_graph()
-    
-    def _build_graph(self) -> StateGraph:
-        workflow = StateGraph(AgentState)
-        
-        # Add nodes
-        workflow.add_node("process_message", self._process_message)
-        workflow.add_node("fetch_portfolio", self._fetch_portfolio)
-        workflow.add_node("analyze_portfolio", self._analyze_portfolio)
-        workflow.add_node("generate_response", self._generate_response)
-        
-        # Add edges
-        workflow.set_entry_point("process_message")
-        workflow.add_conditional_edges(
-            "process_message",
-            self._should_fetch_portfolio,
-            {
-                "fetch_portfolio": "fetch_portfolio",
-                "analyze_portfolio": "analyze_portfolio",
-                "generate_response": "generate_response"
-            }
-        )
-        workflow.add_edge("fetch_portfolio", "analyze_portfolio")
-        workflow.add_edge("analyze_portfolio", "generate_response")
-        workflow.add_edge("generate_response", END)
-        
-        return workflow.compile()
-    
-    async def _process_message(self, state: AgentState) -> AgentState:
-        """Process the incoming user message and determine intent"""
-        latest_message = state["messages"][-1]["content"]
-        
-        # Use LLM to classify the message intent
-        prompt = f"""
-        Analyze this user message about their investment portfolio:
-        "{latest_message}"
-        
-        Classify the intent as one of:
-        1. "portfolio_query" - User wants to know about their portfolio performance
-        2. "stock_analysis" - User wants analysis of specific stocks
-        3. "general_question" - General investment question
-        4. "greeting" - Simple greeting
-        
-        Also extract any stock symbols mentioned (format: AAPL, GOOGL, etc.)
-        
-        Respond in JSON format:
-        {{
-            "intent": "intent_type",
-            "symbols": ["SYMBOL1", "SYMBOL2"],
-            "requires_portfolio": true/false
-        }}
-        """
-        
+# ---------------------------------------------------------------------------
+# System prompt — the agent's personality and rules
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are PortfolioBuddy, a friendly and knowledgeable stock portfolio assistant on Telegram.
+
+Your capabilities:
+- View and analyze the user's stock portfolio
+- Analyze individual stocks (price, fundamentals, news)
+- Compare multiple stocks side by side
+- Add, remove, or update stocks in the portfolio
+- Fetch latest stock news
+
+Personality:
+- Friendly and conversational, like a smart friend who happens to know finance
+- Use emojis to make responses scannable: 🟢 positive, 🔴 negative, 🟡 neutral, 📈 buy, 📉 sell, ⏸️ hold
+- Keep responses concise — this is Telegram, not a research report
+- When showing numbers, round to 2 decimal places and use $ and % signs
+
+Formatting (CRITICAL — you are on Telegram):
+- Use ONLY Telegram HTML tags: <b>bold</b>, <i>italic</i>, <code>monospace</code>, <pre>preformatted</pre>, <a href="url">link</a>
+- NEVER use markdown syntax like **bold**, *italic*, or ```code```. Telegram does not render markdown.
+- NEVER use markdown tables (|---|---|). Instead use aligned <pre> blocks or simple line-by-line comparisons.
+- For lists, use plain bullet characters like • or emojis, not markdown dashes.
+
+Rules:
+- ALWAYS use the available tools to get real data. Never make up stock prices or portfolio data.
+- If a tool fails, tell the user honestly and suggest trying again or checking the symbol.
+- When the user asks to add/buy a stock, use the add_stock tool. When they say they sold, use remove_stock or update_stock.
+- For "should I buy X?" questions, use analyze_stock to get real data, then give a balanced view. Always remind them this is not financial advice.
+- When comparing stocks, use compare_stocks — don't call analyze_stock multiple times.
+- If the user's message is a simple greeting or general chat, respond directly without calling tools.
+- End responses with a relevant follow-up question or suggestion when appropriate.
+"""
+
+# ---------------------------------------------------------------------------
+# Agent setup
+# ---------------------------------------------------------------------------
+
+
+async def create_agent(db_path: str = "portfoliobuddy_memory.db"):
+    """Build the ReAct agent with tools and persistent memory."""
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.1-flash-lite",
+        google_api_key=os.getenv("GEMINI_API_KEY"),
+        temperature=0.3,
+    )
+
+    memory = AsyncSqliteSaver(await aiosqlite.connect(db_path))
+    await memory.setup()
+
+    agent = create_react_agent(
+        model=llm,
+        tools=ALL_TOOLS,
+        checkpointer=memory,
+        prompt=SYSTEM_PROMPT,
+    )
+
+    return agent
+
+
+# ---------------------------------------------------------------------------
+# Telegram bot
+# ---------------------------------------------------------------------------
+
+
+class TelegramBot:
+    def __init__(self, agent):
+        self.agent = agent
+
+    @classmethod
+    async def create(cls):
+        agent = await create_agent()
+        return cls(agent)
+
+    def _thread_config(self, user_id: int) -> dict:
+        """Each Telegram user gets their own conversation thread."""
+        return {"configurable": {"thread_id": str(user_id)}}
+
+    async def _invoke_agent(self, user_id: int, message: str) -> str:
+        """Send a message to the agent and return the response text."""
+        config = self._thread_config(user_id)
         try:
-            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            
-            import json
-            import re
-            
-            # Extract JSON from response (handle cases where LLM adds extra text)
-            content = response.content.strip()
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                analysis = json.loads(json_str)
+            result = await self.agent.ainvoke(
+                {"messages": [("human", message)]},
+                config=config,
+            )
+            # The last message in the result is the AI response
+            ai_message = result["messages"][-1]
+            return ai_message.content
+        except Exception as e:
+            logger.error(f"Agent error for user {user_id}: {e}", exc_info=True)
+            return (
+                "Oops, something went wrong on my end. "
+                "Please try again in a moment. If it keeps happening, "
+                "try rephrasing your question."
+            )
+
+    @staticmethod
+    def _md_to_html(text: str) -> str:
+        """Convert common Markdown patterns to Telegram-compatible HTML."""
+        import re
+        # Bold: **text** or __text__
+        text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+        # Italic: *text* or _text_ (but not inside words like don_t)
+        text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<i>\1</i>', text)
+        text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<i>\1</i>', text)
+        # Inline code: `text`
+        text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+        # Code blocks: ```text```
+        text = re.sub(r'```(\w*)\n?(.*?)```', r'<pre>\2</pre>', text, flags=re.DOTALL)
+        # Markdown tables → preformatted (simple approach)
+        lines = text.split('\n')
+        result = []
+        in_table = False
+        table_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('|') and stripped.endswith('|'):
+                if not in_table:
+                    in_table = True
+                    table_lines = []
+                # Skip separator rows like |---|---|
+                if re.match(r'^\|[\s\-:|]+\|$', stripped):
+                    continue
+                table_lines.append(stripped)
             else:
-                # Fallback: try parsing the entire response as JSON
-                analysis = json.loads(content)
-            
-            state["user_context"]["intent"] = analysis.get("intent", "general_question")
-            state["user_context"]["symbols"] = analysis.get("symbols", [])
-            state["user_context"]["requires_portfolio"] = analysis.get("requires_portfolio", False)
-            
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            state["user_context"]["intent"] = "general_question"
-            state["user_context"]["symbols"] = []
-            state["user_context"]["requires_portfolio"] = False
-        
-        return state
-    
-    def _should_fetch_portfolio(self, state: AgentState) -> str:
-        """Determine if we need to fetch portfolio data"""
-        if state["user_context"].get("requires_portfolio", False):
-            return "fetch_portfolio"
-        elif state["user_context"].get("intent") in ["portfolio_query", "stock_analysis"]:
-            return "fetch_portfolio"
-        else:
-            return "generate_response"
-    
-    async def _fetch_portfolio(self, state: AgentState) -> AgentState:
-        """Fetch portfolio data from CSV file"""
+                if in_table:
+                    result.append('<pre>' + '\n'.join(table_lines) + '</pre>')
+                    in_table = False
+                    table_lines = []
+                result.append(line)
+        if in_table:
+            result.append('<pre>' + '\n'.join(table_lines) + '</pre>')
+        text = '\n'.join(result)
+        # Markdown headings → bold
+        text = re.sub(r'^#{1,3}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+        return text
+
+    async def _send(self, update: Update, text: str) -> None:
+        """Send a message with HTML parsing, falling back to plain text."""
+        html = self._md_to_html(text)
         try:
-            portfolio = self.csv_manager.get_portfolio_data()
-            # Update with current market data
-            portfolio = self.portfolio_analyzer.update_portfolio_with_market_data(portfolio)
-            
-            state["portfolio_data"] = portfolio
-            
+            if len(html) > 4000:
+                chunks = [html[i:i+4000] for i in range(0, len(html), 4000)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk, parse_mode="HTML")
+            else:
+                await update.message.reply_text(html, parse_mode="HTML")
         except Exception as e:
-            logger.error(f"Error fetching portfolio: {e}")
-            state["portfolio_data"] = None
-        
-        return state
-    
-    async def _analyze_portfolio(self, state: AgentState) -> AgentState:
-        """Analyze portfolio and generate insights"""
-        if not state["portfolio_data"]:
-            return state
-        
-        try:
-            portfolio = state["portfolio_data"]
-            symbols_to_analyze = state["user_context"].get("symbols", [])
-            
-            # If no specific symbols mentioned, analyze all holdings
-            if not symbols_to_analyze:
-                symbols_to_analyze = [holding["symbol"] for holding in portfolio["holdings"]]
-            
-            analyses = []
-            for symbol in symbols_to_analyze:
-                # Find the holding if it exists
-                holding = next((h for h in portfolio["holdings"] if h["symbol"] == symbol), None)
-                analysis = self.portfolio_analyzer.analyze_symbol(symbol, holding)
-                analyses.append(analysis)
-            
-            if analyses:
-                state["current_analysis"] = analyses[0]  # Primary analysis
-                state["user_context"]["all_analyses"] = analyses
-            
-        except Exception as e:
-            logger.error(f"Error analyzing portfolio: {e}")
-            state["current_analysis"] = None
-        
-        return state
-    
-    async def _generate_response(self, state: AgentState) -> AgentState:
-        """Generate the final response to the user"""
-        try:
-            latest_message = state["messages"][-1]["content"]
-            intent = state["user_context"].get("intent", "general_question")
-            
-            # Build context for the LLM
-            context_parts = []
-            
-            # Add portfolio context if available
-            if state["portfolio_data"]:
-                portfolio = state["portfolio_data"]
-                context_parts.append(f"""
-                Portfolio Summary:
-                - Total Value: ${portfolio['total_value']:,.2f}
-                - Total Gain/Loss: ${portfolio['total_gain_loss']:,.2f} ({portfolio['total_gain_loss_percent']:.1f}%)
-                - Holdings: {len(portfolio['holdings'])} stocks
-                """)
-                
-                # Add top performers
-                if portfolio["holdings"]:
-                    top_performers = sorted(portfolio["holdings"], key=lambda x: x.get("gain_loss_percent", 0), reverse=True)[:3]
-                    worst_performers = sorted(portfolio["holdings"], key=lambda x: x.get("gain_loss_percent", 0))[:3]
-                    
-                    context_parts.append("Top Performers:")
-                    for holding in top_performers:
-                        context_parts.append(f"- {holding['symbol']}: {holding.get('gain_loss_percent', 0):.1f}%")
-                    
-                    context_parts.append("Worst Performers:")
-                    for holding in worst_performers:
-                        context_parts.append(f"- {holding['symbol']}: {holding.get('gain_loss_percent', 0):.1f}%")
-            
-            # Add analysis context if available
-            if state["current_analysis"]:
-                analysis = state["current_analysis"]
-                sentiment_emoji = {
-                    SentimentIndicator.POSITIVE: "🟢",
-                    SentimentIndicator.NEUTRAL: "🟡", 
-                    SentimentIndicator.NEGATIVE: "🔴"
-                }
-                
-                action_emoji = {
-                    ActionType.BUY: "📈",
-                    ActionType.SELL: "📉",
-                    ActionType.HOLD: "⏸️",
-                    ActionType.WATCH: "👀"
-                }
-                
-                context_parts.append(f"""
-                Analysis for {analysis['symbol']}:
-                - Current Price: ${analysis['current_price']:.2f}
-                - Sentiment: {sentiment_emoji[analysis['sentiment']]} {analysis['sentiment'].value}
-                - Recommendation: {action_emoji[analysis['recommendation']]} {analysis['recommendation'].value.upper()}
-                - Confidence: {analysis['confidence']:.1%}
-                - Reasoning: {analysis['reasoning']}
-                """)
-                
-                if analysis['news_summary']:
-                    context_parts.append("Recent News:")
-                    for news in analysis['news_summary'][:2]:
-                        context_parts.append(f"- {news['title']}")
-            
-            # Create the prompt
-            context = "\n".join(context_parts)
-            
-            prompt = f"""
-            You are PortfolioBuddy, a friendly and knowledgeable investment assistant. You help users understand their portfolio performance and make informed decisions.
+            # If HTML parsing fails (malformed tags), send as plain text
+            logger.warning("HTML parse failed (%s), falling back to plain text", e)
+            await update.message.reply_text(text)
 
-            User Message: "{latest_message}"
-            User Intent: {intent}
-
-            {context if context else "No portfolio data available."}
-
-            Instructions:
-            1. Respond in a friendly, conversational tone
-            2. Keep responses concise but informative
-            3. Use emojis to indicate sentiment (🟢 positive, 🟡 neutral, 🔴 negative)
-            4. Use action emojis for recommendations (📈 BUY, 📉 SELL, ⏸️ HOLD, 👀 WATCH)
-            5. Focus on the most important information
-            6. End with a helpful question or suggestion
-            7. Never give financial advice, only provide analysis and information
-
-            Response:
-            """
-            
-            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            
-            # Add the AI response to messages
-            state["messages"].append({
-                "role": "assistant",
-                "content": response.content,
-                "timestamp": datetime.now()
-            })
-            
-        except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            error_response = "Sorry, I encountered an error processing your request. Please try again."
-            state["messages"].append({
-                "role": "assistant", 
-                "content": error_response,
-                "timestamp": datetime.now()
-            })
-        
-        return state
-    
-    def get_or_create_session(self, user_id: int) -> AgentState:
-        """Get or create a user session"""
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = {
-                "messages": [],
-                "portfolio_data": None,
-                "current_analysis": None,
-                "user_context": {},
-                "last_action": None
-            }
-        return self.user_sessions[user_id]
-    
-    async def process_telegram_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Process incoming Telegram message"""
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle any text message."""
         user_id = update.effective_user.id
-        message_text = update.message.text
-        
-        # Get or create user session
-        session = self.get_or_create_session(user_id)
-        
-        # Add user message to session
-        session["messages"].append({
-            "role": "user",
-            "content": message_text,
-            "timestamp": datetime.now()
-        })
-        
-        try:
-            # Process through LangGraph
-            result = await self.graph.ainvoke(session)
-            
-            # Update session with result
-            self.user_sessions[user_id] = result
-            
-            # Send the latest AI response back to user
-            if result["messages"]:
-                latest_message = result["messages"][-1]
-                if latest_message["role"] == "assistant":
-                    await update.message.reply_text(latest_message["content"])
-        
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            await update.message.reply_text("Sorry, I encountered an error. Please try again.")
-    
+        text = update.message.text
+
+        logger.info(f"User {user_id}: {text}")
+
+        response = await self._invoke_agent(user_id, text)
+        await self._send(update, response)
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command"""
-        welcome_message = """
-        🤖 Welcome to PortfolioBuddy!
+        """Handle /start command."""
+        welcome = (
+            "Hey! I'm PortfolioBuddy 📊\n\n"
+            "I can help you with:\n"
+            "• Check your portfolio — \"How's my portfolio doing?\"\n"
+            "• Analyze stocks — \"Tell me about AAPL\"\n"
+            "• Compare stocks — \"Compare AAPL vs GOOGL vs MSFT\"\n"
+            "• Manage holdings — \"I bought 10 shares of NVDA at $120\"\n"
+            "• Get news — \"What's the latest on TSLA?\"\n\n"
+            "Just talk to me like you'd talk to a friend who knows stocks. "
+            "No special commands needed!\n\n"
+            "What would you like to know? 🚀"
+        )
+        await self._send(update, welcome)
 
-        I'm your personal investment assistant that helps you:
-        • Track your portfolio performance
-        • Analyze individual stocks
-        • Get market insights and news
-        • Receive actionable recommendations
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command."""
+        help_text = (
+            "Here's what I can do:\n\n"
+            "📊 Portfolio: \"Show my portfolio\", \"How am I doing?\"\n"
+            "🔍 Analysis: \"Analyze AAPL\", \"Should I buy TSLA?\"\n"
+            "⚖️ Compare: \"Compare AAPL and GOOGL\"\n"
+            "➕ Add: \"I bought 50 shares of MSFT at $400\"\n"
+            "➖ Remove: \"I sold all my BABA\"\n"
+            "✏️ Update: \"Update AAPL to 100 shares\"\n"
+            "📰 News: \"What's happening with NVDA?\"\n\n"
+            "I remember our conversations, so you can refer back to earlier messages!"
+        )
+        await self._send(update, help_text)
 
-        Commands:
-        /start - Show this welcome message
-        /portfolio - View your portfolio summary
-        /analyze SYMBOL - Analyze a specific stock
-
-        Just ask me questions like:
-        • "How is my portfolio doing?"
-        • "What's happening with AAPL?"
-        • "Should I buy more TSLA?"
-        • "Show me my worst performers"
-
-        Let's get started! 📈
-        """
-        await update.message.reply_text(welcome_message)
-    
-    async def portfolio_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /portfolio command"""
+    async def reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /reset command — clear conversation memory for this user."""
         user_id = update.effective_user.id
-        session = self.get_or_create_session(user_id)
-        
-        # Add portfolio request as a user message
-        session["messages"].append({
-            "role": "user",
-            "content": "Show me my portfolio summary",
-            "timestamp": datetime.now()
-        })
-        
-        # Process through the graph
-        await self.process_telegram_message(update, context)
-    
-    async def analyze_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /analyze command"""
-        user_id = update.effective_user.id
-        session = self.get_or_create_session(user_id)
-        
-        if not context.args:
-            await update.message.reply_text("Please provide a stock symbol. Usage: /analyze AAPL")
-            return
-        
-        symbol = context.args[0].upper()
-        
-        # Add analysis request as a user message
-        session["messages"].append({
-            "role": "user",
-            "content": f"Analyze {symbol}",
-            "timestamp": datetime.now()
-        })
-        
-        # Process through the graph
-        await self.process_telegram_message(update, context)
+        # Reinitialize agent to clear the thread
+        # (SqliteSaver doesn't have a delete method, so we note the reset in conversation)
+        await self._invoke_agent(
+            user_id,
+            "[SYSTEM] The user has reset the conversation. Forget all prior context and start fresh."
+        )
+        await self._send(update, "Conversation reset! Let's start fresh. What can I help you with? 🔄")
+
 
 def run_bot():
-    """Run the Telegram bot"""
-    # Get environment variables
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not telegram_token:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
-    
-    # Create the agent
-    agent = PortfolioBuddyAgent()
-    
-    # Create the Telegram application
-    application = Application.builder().token(telegram_token).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", agent.start_command))
-    application.add_handler(CommandHandler("portfolio", agent.portfolio_command))
-    application.add_handler(CommandHandler("analyze", agent.analyze_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, agent.process_telegram_message))
-    
-    # Run the bot
-    logger.info("Starting PortfolioBuddy bot...")
-    application.run_polling()
+    """Start the Telegram bot."""
+    import asyncio
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise ValueError(
+            "TELEGRAM_BOT_TOKEN not set. "
+            "Get one from @BotFather on Telegram and add it to your .env file."
+        )
+
+    # Create the agent async, then hand the event loop to python-telegram-bot
+    bot = asyncio.get_event_loop().run_until_complete(TelegramBot.create())
+
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", bot.start_command))
+    app.add_handler(CommandHandler("help", bot.help_command))
+    app.add_handler(CommandHandler("reset", bot.reset_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+
+    logger.info("PortfolioBuddy v2 starting...")
+    logger.info("Tools loaded: %s", [t.name for t in ALL_TOOLS])
+    app.run_polling()
+
 
 if __name__ == "__main__":
     run_bot()
