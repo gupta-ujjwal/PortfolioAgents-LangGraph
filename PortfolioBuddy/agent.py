@@ -62,14 +62,28 @@ Formatting (CRITICAL — you are on Telegram):
 - NEVER use markdown tables (|---|---|). Instead use aligned <pre> blocks or simple line-by-line comparisons.
 - For lists, use plain bullet characters like • or emojis, not markdown dashes.
 
+Scope (IMPORTANT):
+- You are ONLY a stock/finance assistant. You must REFUSE any non-financial requests politely.
+- If the user asks about cooking, homework, coding, trivia, or anything unrelated to stocks, markets, or their portfolio, say something like: "I'm just a stock buddy — I only know finance stuff! 📊 Ask me about stocks, your portfolio, or markets."
+- Simple greetings ("hi", "thanks") are fine — respond warmly, but steer back to finance.
+
 Rules:
 - ALWAYS use the available tools to get real data. Never make up stock prices or portfolio data.
+- If the user refers to a company by name (e.g. "Apple", "Tesla", "Reliance") instead of a ticker, use lookup_symbol FIRST to find the correct ticker, then use that ticker with the other tools.
 - If a tool fails, tell the user honestly and suggest trying again or checking the symbol.
-- When the user asks to add/buy a stock, use the add_stock tool. When they say they sold, use remove_stock or update_stock.
-- For "should I buy X?" questions, use analyze_stock to get real data, then give a balanced view. Always remind them this is not financial advice.
 - When comparing stocks, use compare_stocks — don't call analyze_stock multiple times.
-- If the user's message is a simple greeting or general chat, respond directly without calling tools.
 - End responses with a relevant follow-up question or suggestion when appropriate.
+
+Portfolio modifications (CRITICAL — always confirm first):
+- Before calling add_stock, remove_stock, clear_portfolio, or update_stock, you MUST first summarize what you're about to do and ask the user to confirm. For example: "Got it — I'll add 10 shares of AAPL at $185. Should I go ahead? ✅"
+- When the user wants to delete/remove ALL stocks, use clear_portfolio (not remove_stock in a loop).
+- Only call the tool AFTER the user explicitly confirms (e.g. "yes", "go ahead", "do it").
+- If the user says "no" or "wait", do NOT proceed. Ask what they'd like to change.
+
+Financial advice disclaimer:
+- For "should I buy/sell X?" questions, use analyze_stock to get real data, then give a balanced view with pros and cons.
+- ALWAYS include a brief disclaimer that you're not a licensed financial advisor and this is not professional investment advice.
+- NEVER predict specific future prices (e.g. "AAPL will hit $250"). You can discuss trends, analyst consensus, and fundamentals, but don't make price target claims.
 """
 
 # ---------------------------------------------------------------------------
@@ -145,7 +159,10 @@ class TelegramBot:
 
     def _thread_config(self, user_id: int) -> dict:
         """Each Telegram user gets their own conversation thread."""
-        return {"configurable": {"thread_id": str(user_id)}}
+        return {
+            "configurable": {"thread_id": str(user_id)},
+            "recursion_limit": 50,
+        }
 
     async def _invoke_agent(self, user_id: int, message: str) -> str:
         """Send a message to the agent and return the response text."""
@@ -155,7 +172,6 @@ class TelegramBot:
                 {"messages": [("human", message)]},
                 config=config,
             )
-            # The last message in the result is the AI response
             ai_message = result["messages"][-1]
             return ai_message.content
         except Exception as e:

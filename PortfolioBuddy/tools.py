@@ -8,11 +8,11 @@ messages so the LLM can reason about failures and retry or inform the user.
 """
 
 import os
-import csv
-import json
+import sqlite3
 import time
 import logging
 from typing import List, Dict, Optional
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -21,7 +21,7 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-CSV_PATH = os.getenv("PORTFOLIO_CSV_PATH", "portfolio.csv")
+DB_PATH = os.getenv("PORTFOLIO_DB_PATH", "portfolio.db")
 
 # ---------------------------------------------------------------------------
 # Retry helper for flaky external APIs
@@ -50,42 +50,82 @@ def retry(max_attempts: int = 3, delay: float = 1.0):
 # Internal helpers (not exposed to the LLM)
 # ---------------------------------------------------------------------------
 
-def _read_csv() -> List[Dict]:
-    """Read portfolio CSV and return list of row dicts."""
-    path = CSV_PATH
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = []
-        for row in reader:
-            if not row.get("Symbol", "").strip():
-                continue
-            rows.append({
-                "symbol": row["Symbol"].upper().strip(),
-                "quantity": float(row["Quantity"]),
-                "avg_cost": float(row["Average Cost"]),
-                "notes": row.get("Notes", ""),
-                "last_updated": row.get("Last Updated", ""),
-            })
-        return rows
+@contextmanager
+def _get_db():
+    """Get a sqlite3 connection with WAL mode and busy timeout."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def _write_csv(rows: List[Dict]) -> None:
-    """Write rows back to the portfolio CSV."""
-    path = CSV_PATH
-    fieldnames = ["Symbol", "Quantity", "Average Cost", "Notes", "Last Updated"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({
-                "Symbol": row["symbol"],
-                "Quantity": row["quantity"],
-                "Average Cost": row["avg_cost"],
-                "Notes": row.get("notes", ""),
-                "Last Updated": row.get("last_updated", datetime.now().strftime("%Y-%m-%d")),
-            })
+def _init_db():
+    """Create the holdings table if it doesn't exist."""
+    with _get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS holdings (
+                symbol TEXT PRIMARY KEY,
+                quantity REAL NOT NULL,
+                avg_cost REAL NOT NULL,
+                notes TEXT DEFAULT '',
+                last_updated TEXT DEFAULT ''
+            )
+        """)
+
+
+
+def _get_all_holdings() -> List[Dict]:
+    """Read all holdings from DB."""
+    with _get_db() as conn:
+        rows = conn.execute("SELECT * FROM holdings ORDER BY symbol").fetchall()
+        return [dict(r) for r in rows]
+
+
+def _get_holding(symbol: str) -> Optional[Dict]:
+    """Read a single holding."""
+    with _get_db() as conn:
+        row = conn.execute("SELECT * FROM holdings WHERE symbol = ?", (symbol,)).fetchone()
+        return dict(row) if row else None
+
+
+def _upsert_holding(symbol: str, quantity: float, avg_cost: float, notes: str = "", last_updated: str = ""):
+    """Insert or replace a holding."""
+    with _get_db() as conn:
+        conn.execute("""
+            INSERT INTO holdings (symbol, quantity, avg_cost, notes, last_updated)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                quantity = excluded.quantity,
+                avg_cost = excluded.avg_cost,
+                notes = excluded.notes,
+                last_updated = excluded.last_updated
+        """, (symbol, quantity, avg_cost, notes, last_updated))
+
+
+def _delete_holding(symbol: str) -> bool:
+    """Delete a holding. Returns True if it existed."""
+    with _get_db() as conn:
+        cursor = conn.execute("DELETE FROM holdings WHERE symbol = ?", (symbol,))
+        return cursor.rowcount > 0
+
+
+def _clear_all_holdings() -> int:
+    """Delete all holdings. Returns count deleted."""
+    with _get_db() as conn:
+        cursor = conn.execute("DELETE FROM holdings")
+        return cursor.rowcount
+
+
+# Initialize DB on module load
+_init_db()
 
 
 @retry(max_attempts=3, delay=1.0)
@@ -183,8 +223,8 @@ def _format_percent(val: float) -> str:
 def get_portfolio_summary() -> str:
     """Get a complete summary of the user's stock portfolio with current market prices, total value, and gain/loss for each holding. Use this when the user asks about their portfolio, holdings, or overall performance."""
     try:
-        rows = _read_csv()
-        if not rows:
+        holdings = _get_all_holdings()
+        if not holdings:
             return "Portfolio is empty. No stocks found. The user can ask me to add stocks."
 
         results = []
@@ -192,7 +232,7 @@ def get_portfolio_summary() -> str:
         total_cost = 0.0
         failed_symbols = []
 
-        for row in rows:
+        for row in holdings:
             symbol = row["symbol"]
             qty = row["quantity"]
             avg_cost = row["avg_cost"]
@@ -267,8 +307,7 @@ def analyze_stock(symbol: str) -> str:
         news = _fetch_news(symbol)
 
         # Check if user holds this stock
-        rows = _read_csv()
-        holding = next((r for r in rows if r["symbol"] == symbol), None)
+        holding = _get_holding(symbol)
 
         lines = [
             f"Analysis for {symbol}",
@@ -327,8 +366,8 @@ def compare_stocks(symbols: list[str]) -> str:
         return "Please provide at least 2 stock symbols to compare."
 
     symbols = [s.upper().strip() for s in symbols]
-    rows = _read_csv()
-    holdings_map = {r["symbol"]: r for r in rows}
+    all_holdings = _get_all_holdings()
+    holdings_map = {r["symbol"]: r for r in all_holdings}
 
     data = []
     failed = []
@@ -431,8 +470,8 @@ def add_stock(symbol: str, quantity: float, avg_cost: float, notes: str = "") ->
         return f"Average cost must be positive. Got {avg_cost}."
 
     try:
-        rows = _read_csv()
-        existing = next((r for r in rows if r["symbol"] == symbol), None)
+        now = datetime.now().strftime("%Y-%m-%d")
+        existing = _get_holding(symbol)
 
         if existing:
             # Weighted average cost
@@ -441,27 +480,16 @@ def add_stock(symbol: str, quantity: float, avg_cost: float, notes: str = "") ->
             combined_qty = existing["quantity"] + quantity
             new_avg = (old_total + new_total) / combined_qty
 
-            existing["quantity"] = round(combined_qty, 4)
-            existing["avg_cost"] = round(new_avg, 2)
-            existing["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-            if notes:
-                existing["notes"] = notes
-
-            _write_csv(rows)
+            new_qty = round(combined_qty, 4)
+            new_avg = round(new_avg, 2)
+            _upsert_holding(symbol, new_qty, new_avg, notes or existing["notes"], now)
             return (
                 f"Updated {symbol} in portfolio. "
-                f"New position: {existing['quantity']} shares @ {_format_currency(existing['avg_cost'])} avg cost. "
+                f"New position: {new_qty} shares @ {_format_currency(new_avg)} avg cost. "
                 f"(Added {quantity} shares @ {_format_currency(avg_cost)})"
             )
         else:
-            rows.append({
-                "symbol": symbol,
-                "quantity": quantity,
-                "avg_cost": avg_cost,
-                "notes": notes,
-                "last_updated": datetime.now().strftime("%Y-%m-%d"),
-            })
-            _write_csv(rows)
+            _upsert_holding(symbol, quantity, avg_cost, notes, now)
             return f"Added {symbol} to portfolio: {quantity} shares @ {_format_currency(avg_cost)}."
 
     except Exception as e:
@@ -473,15 +501,10 @@ def remove_stock(symbol: str) -> str:
     """Remove a stock entirely from the user's portfolio. Use this when the user says they sold all shares of a stock or wants to remove a holding."""
     symbol = symbol.upper().strip()
     try:
-        rows = _read_csv()
-        original_len = len(rows)
-        rows = [r for r in rows if r["symbol"] != symbol]
-
-        if len(rows) == original_len:
+        if _delete_holding(symbol):
+            return f"Removed {symbol} from portfolio."
+        else:
             return f"{symbol} is not in the portfolio. No changes made."
-
-        _write_csv(rows)
-        return f"Removed {symbol} from portfolio."
 
     except Exception as e:
         return f"Error removing {symbol}: {e}. Please try again."
@@ -492,28 +515,30 @@ def update_stock(symbol: str, quantity: float = 0, avg_cost: float = 0, notes: s
     """Update an existing stock's quantity, average cost, or notes. Use this when the user wants to correct their holdings or sold some (not all) shares."""
     symbol = symbol.upper().strip()
     try:
-        rows = _read_csv()
-        existing = next((r for r in rows if r["symbol"] == symbol), None)
+        existing = _get_holding(symbol)
 
         if not existing:
             return f"{symbol} is not in the portfolio. Use add_stock to add it first."
 
         changes = []
+        new_qty = existing["quantity"]
+        new_cost = existing["avg_cost"]
+        new_notes = existing["notes"]
+
         if quantity > 0:
-            existing["quantity"] = quantity
+            new_qty = quantity
             changes.append(f"quantity to {quantity}")
         if avg_cost > 0:
-            existing["avg_cost"] = avg_cost
+            new_cost = avg_cost
             changes.append(f"avg cost to {_format_currency(avg_cost)}")
         if notes:
-            existing["notes"] = notes
+            new_notes = notes
             changes.append(f"notes to '{notes}'")
 
         if not changes:
             return "No changes specified. Provide quantity, avg_cost, or notes to update."
 
-        existing["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-        _write_csv(rows)
+        _upsert_holding(symbol, new_qty, new_cost, new_notes, datetime.now().strftime("%Y-%m-%d"))
         return f"Updated {symbol}: {', '.join(changes)}."
 
     except Exception as e:
@@ -543,6 +568,54 @@ def get_stock_news(symbol: str) -> str:
         return f"Error fetching news for {symbol}: {e}. Please try again."
 
 
+@tool
+def clear_portfolio() -> str:
+    """Remove ALL stocks from the user's portfolio at once. Use this when the user wants to delete everything, start fresh, or clear their entire portfolio."""
+    try:
+        holdings = _get_all_holdings()
+        if not holdings:
+            return "Portfolio is already empty. Nothing to clear."
+
+        symbols = [h["symbol"] for h in holdings]
+        count = _clear_all_holdings()
+        return f"Cleared entire portfolio. Removed {count} stock(s): {', '.join(symbols)}."
+
+    except Exception as e:
+        return f"Error clearing portfolio: {e}. Please try again."
+
+
+@tool
+def lookup_symbol(query: str) -> str:
+    """Look up a stock ticker symbol by company name or keyword. Use this when the user refers to a company by name (e.g. 'Apple', 'Tesla', 'Reliance') instead of a ticker symbol. Returns matching symbols so you can then call other tools with the correct ticker."""
+    query = query.strip()
+    if not query:
+        return "Please provide a company name or keyword to search for."
+    try:
+        results = yf.Search(query)
+        quotes = results.quotes if hasattr(results, "quotes") else []
+        if not quotes:
+            return f"No results found for '{query}'. Try a different spelling or use the ticker symbol directly."
+
+        lines = [f"Search results for '{query}':", ""]
+        for q in quotes[:5]:
+            symbol = q.get("symbol", "")
+            name = q.get("shortname") or q.get("longname", "")
+            exchange = q.get("exchange", "")
+            qtype = q.get("quoteType", "")
+            line = f"  {symbol} — {name}"
+            if exchange:
+                line += f" ({exchange})"
+            if qtype and qtype != "EQUITY":
+                line += f" [{qtype}]"
+            lines.append(line)
+
+        lines.append("")
+        lines.append("Use the symbol (e.g. the first column) for further analysis.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching for '{query}': {e}. Try using the ticker symbol directly."
+
+
 # Collect all tools for the agent
 ALL_TOOLS = [
     get_portfolio_summary,
@@ -550,6 +623,8 @@ ALL_TOOLS = [
     compare_stocks,
     add_stock,
     remove_stock,
+    clear_portfolio,
     update_stock,
     get_stock_news,
+    lookup_symbol,
 ]
