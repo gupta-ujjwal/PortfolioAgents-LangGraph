@@ -15,7 +15,6 @@ from datetime import datetime
 
 import aiosqlite
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -78,14 +77,44 @@ Rules:
 # ---------------------------------------------------------------------------
 
 
+def _create_llm():
+    """Create the LLM based on LLM_PROVIDER env var.
+
+    Supported providers: gemini (default), perplexity, litellm.
+    """
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower().strip()
+
+    if provider == "perplexity":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=os.getenv("PERPLEXITY_MODEL", "sonar"),
+            api_key=os.getenv("PERPLEXITY_API_KEY"),
+            base_url="https://api.perplexity.ai",
+            temperature=0.3,
+        )
+    elif provider == "litellm":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=os.getenv("LITELLM_MODEL", "gpt-4o"),
+            api_key=os.getenv("LITELLM_API_KEY"),
+            base_url=os.getenv("LITELLM_API_BASE"),
+            temperature=0.3,
+        )
+    else:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+            google_api_key=os.getenv("GEMINI_API_KEY"),
+            temperature=0.3,
+        )
+
+
 async def create_agent(db_path: str = "portfoliobuddy_memory.db"):
     """Build the ReAct agent with tools and persistent memory."""
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-3.1-flash-lite",
-        google_api_key=os.getenv("GEMINI_API_KEY"),
-        temperature=0.3,
-    )
+    llm = _create_llm()
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower().strip()
+    logger.info("LLM provider: %s | model: %s", provider, llm.model_name if hasattr(llm, 'model_name') else llm.model)
 
     memory = AsyncSqliteSaver(await aiosqlite.connect(db_path))
     await memory.setup()
