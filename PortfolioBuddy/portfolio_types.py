@@ -1,17 +1,22 @@
-from typing import TypedDict, List, Optional, Dict, Any
+from typing import TypedDict, List, Optional, Dict, Any, Annotated
 from datetime import datetime
 from enum import Enum
+from langgraph.graph.message import add_messages
+from langchain_core.messages import BaseMessage
+
 
 class SentimentIndicator(Enum):
     POSITIVE = "positive"
     NEUTRAL = "neutral"
     NEGATIVE = "negative"
 
+
 class ActionType(Enum):
     BUY = "buy"
     SELL = "sell"
     HOLD = "hold"
     WATCH = "watch"
+
 
 class PortfolioHolding(TypedDict):
     symbol: str
@@ -21,22 +26,18 @@ class PortfolioHolding(TypedDict):
     value: Optional[float]
     gain_loss: Optional[float]
     gain_loss_percent: Optional[float]
+    notes: str
+    last_updated: str
+
 
 class PortfolioData(TypedDict):
     holdings: List[PortfolioHolding]
-    total_value: Optional[float]
-    total_gain_loss: Optional[float]
-    total_gain_loss_percent: Optional[float]
+    total_value: float
+    total_cost: float
+    total_gain_loss: float
+    total_gain_loss_percent: float
     last_updated: Optional[datetime]
 
-class NewsItem(TypedDict):
-    title: str
-    content: str
-    source: str
-    url: str
-    published_at: datetime
-    sentiment: SentimentIndicator
-    relevance_score: float
 
 class MarketData(TypedDict):
     symbol: str
@@ -48,34 +49,22 @@ class MarketData(TypedDict):
     pe_ratio: Optional[float]
     day_high: Optional[float]
     day_low: Optional[float]
+    fifty_two_week_high: Optional[float]
+    fifty_two_week_low: Optional[float]
 
-class AnalysisResult(TypedDict):
-    symbol: str
-    current_price: float
-    sentiment: SentimentIndicator
-    news_summary: List[NewsItem]
-    technical_indicators: Dict[str, Any]
-    recommendation: ActionType
-    confidence: float
-    reasoning: str
+
+class NewsItem(TypedDict):
+    title: str
+    source: str
+    url: str
+    published_at: str
+    sentiment: str
+
 
 class AgentState(TypedDict):
-    messages: List[Dict[str, Any]]
-    portfolio_data: Optional[PortfolioData]
-    current_analysis: Optional[AnalysisResult]
-    user_context: Dict[str, Any]
-    last_action: Optional[str]
+    """State for the PortfolioBuddy agent.
 
-class TelegramMessage(TypedDict):
-    message_id: int
-    user_id: int
-    username: str
-    text: str
-    timestamp: datetime
-
-class AgentResponse(TypedDict):
-    text: str
-    sentiment: Optional[SentimentIndicator]
-    recommendation: Optional[ActionType]
-    data: Optional[Dict[str, Any]]
-    follow_up_questions: List[str]
+    Uses LangGraph's message annotation so the graph automatically
+    accumulates messages across turns instead of overwriting them.
+    """
+    messages: Annotated[list[BaseMessage], add_messages]
