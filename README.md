@@ -1,91 +1,127 @@
-# LangGraph Trading Bot Series
+# PortfolioAgents-LangGraph
 
-A comprehensive tutorial series for building automated trading bots using LangGraph and Google's Gemini API. This repository contains code examples and resources for a three-article series that progresses from basic agent concepts to a full-scale multi-agent trading system.
+A hands-on article series on building AI agents with LangGraph — starting from first principles and progressing to real agentic systems. Each article builds on the previous one, evolving **PortfolioBuddy**, a Telegram-based stock portfolio assistant.
 
-## Article Series Overview
+## What It Looks Like
 
-### Article 1: Introduction to LangGraph and Basic Agents
-- Understanding LangGraph fundamentals
-- Building simple agents with state management
-- Introduction to Gemini API integration
-- Basic decision-making patterns
+<p align="center">
+  <img src="assets/portfolio-summary.webp" width="280" alt="Portfolio summary" />
+  <img src="assets/analyze-compare.webp" width="280" alt="Stock analysis and comparison" />
+  <img src="assets/add-stock.webp" width="280" alt="Adding stocks via natural language" />
+</p>
 
-### Article 2: Multi-Agent Systems and Market Integration
-- Coordinating multiple specialized agents
-- Market data integration and processing
-- Basic trading logic and signal generation
-- Agent communication patterns
+> Talk to PortfolioBuddy like a friend — check your portfolio, analyze stocks, compare side-by-side, and manage holdings through natural conversation on Telegram.
 
-### Article 3: Advanced Trading System
-- Complete multi-agent trading architecture
-- Risk management and portfolio optimization
-- Backtesting framework and performance analysis
-- Production-ready deployment considerations
+## Article Series
 
-## Prerequisites
+### Article 1: AI Agents from First Principles
+Build a portfolio assistant on Telegram using LangGraph with state management, Yahoo Finance integration, and news sentiment analysis. Covers the basics — what agents are, how LangGraph works, and wiring up a functional bot.
 
-- Python 3.8 or higher
-- Google Gemini API key (free tier available)
-- Basic understanding of Python and trading concepts
+- [Read on Medium](https://medium.com/@ujjwalgupta_97954/ai-agents-from-first-principles-a-hands-on-guide-with-portfoliobuddy-b37017b0dd77)
+- [Code (`porfolioBuddyV1` branch)](https://github.com/gupta-ujjwal/PortfolioAgents-LangGraph/tree/porfolioBuddyV1)
 
-## Setup Instructions
+**What's in v1:**
+- LangGraph StateGraph with hardcoded routing (intent classification → fixed paths)
+- Yahoo Finance market data + news sentiment via TextBlob
+- CSV-based portfolio storage
+- Telegram bot with `/start`, `/portfolio`, `/analyze` commands
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd ExampleAgents
-   ```
+### Article 2: What Makes an AI Agent Actually Agentic?
+Tear apart v1's limitations and rebuild with real agency. The LLM picks its own tools, conversations persist across restarts, and failures are handled gracefully.
 
-2. **Create and activate virtual environment**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+- [Read on Medium](https://medium.com/towards-artificial-intelligence/what-makes-an-ai-agent-actually-agentic-building-beyond-the-basics-with-langgraph-cf73c659d753)
+- [Code (`master` branch)](https://github.com/gupta-ujjwal/PortfolioAgents-LangGraph/tree/master)
 
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+**What changed in v2:**
+- ReAct agent with `create_react_agent` — LLM decides which tools to call
+- 9 tools: portfolio summary, stock analysis, comparison, add/remove/update holdings, news, symbol lookup
+- SQLite-backed persistent memory (conversations survive restarts)
+- Error recovery with retry decorator + descriptive errors for LLM reasoning
+- Multi-LLM provider support (Gemini, Perplexity, LiteLLM)
+- Natural language portfolio management ("I bought 20 shares of AMD at $150")
 
-4. **Set up environment variables**
-   Create a `.env` file in the root directory:
-   ```
-   GOOGLE_API_KEY=your_gemini_api_key_here
-   ```
+### Article 3: Multi-Agent Systems *(Coming Soon)*
+Splitting a single agent into specialized agents — research, risk management, execution. Multi-portfolio support, crypto, multi-country markets, and live news-driven suggestions.
 
-## Getting Gemini API Key
+## Quick Start
 
-1. Visit [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. Sign in with your Google account
-3. Create a new API key
-4. Copy the key to your `.env` file
+### Prerequisites
+- Python 3.10+
+- A [Gemini API key](https://makersuite.google.com/app/apikey) (free tier works)
+- A [Telegram bot token](https://t.me/botfather)
 
-The Gemini API offers a generous free tier, making it perfect for development and learning without upfront costs.
+### Setup
+
+```bash
+git clone https://github.com/gupta-ujjwal/PortfolioAgents-LangGraph.git
+cd PortfolioAgents-LangGraph
+
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Environment Variables
+
+```bash
+cd PortfolioBuddy
+cp .env.example .env
+# Edit .env with your keys
+```
+
+Required:
+- `GEMINI_API_KEY` — Google Gemini API key
+- `TELEGRAM_BOT_TOKEN` — from @BotFather on Telegram
+
+Optional:
+- `LLM_PROVIDER` — `gemini` (default), `perplexity`, or `litellm`
+- `NEWS_API_KEY` — for enhanced news (falls back to Yahoo Finance)
+
+### Run
+
+```bash
+cd PortfolioBuddy
+python agent.py
+```
+
+Then open your bot on Telegram and start chatting. No special commands needed — just talk naturally:
+- "How's my portfolio doing?"
+- "Analyze NVDA"
+- "Compare AAPL and GOOGL"
+- "I bought 50 shares of MSFT at $400"
+- "What's the latest news on TSLA?"
 
 ## Project Structure
 
-As you progress through the articles, new folders will be created:
-- `article-1-intro/` - Basic LangGraph concepts and simple agents
-- `article-2-intermediate/` - Multi-agent coordination and market data
-- `article-3-advanced/` - Complete trading system with risk management
+```
+PortfolioAgents-LangGraph/
+├── PortfolioBuddy/
+│   ├── agent.py              # ReAct agent + Telegram bot
+│   ├── tools.py              # 9 LLM-callable tools (market data, portfolio ops)
+│   ├── portfolio_types.py    # TypedDict definitions and enums
+│   ├── .env.example          # Environment variable template
+│   ├── sample_portfolio.csv  # Sample portfolio to get started
+│   └── requirements.txt      # PortfolioBuddy-specific deps
+├── requirements.txt          # Top-level dependencies
+├── CLAUDE.md                 # AI assistant context
+└── README.md
+```
 
-## Dependencies
+## Branches
 
-- **LangGraph**: Framework for building stateful, multi-actor applications
-- **LangChain**: Core framework for LLM applications
-- **Google Generative AI**: Gemini API integration
-- **Pandas/NumPy**: Data manipulation and analysis
-- **YFinance**: Market data retrieval
-- **Matplotlib**: Visualization for analysis
+| Branch | Article | Description |
+|--------|---------|-------------|
+| `porfolioBuddyV1` | Article 1 | Smart workflow — hardcoded routing, CSV storage |
+| `master` | Article 2 | Real agent — tool-calling, SQLite memory, error recovery |
 
-## Contributing
+## FYIs
 
-This repository is designed as a learning resource. Feel free to fork and modify the examples for your own trading strategies and research.
-
-## Disclaimer
-
-This educational content is for learning purposes only. Trading financial markets involves substantial risk. Always conduct thorough research and consider consulting with financial professionals before implementing real trading strategies.
+- **Not financial advice.** This is an educational project. The bot gives analysis, not recommendations. Always do your own research.
+- **Yahoo Finance rate limits.** If you hammer the bot with requests, Yahoo Finance may temporarily throttle you. The retry decorator handles transient failures, but give it a few seconds between rapid-fire queries.
+- **SQLite memory grows.** The conversation memory DB (`portfoliobuddy_memory.db`) accumulates over time. Use `/reset` in Telegram to clear your conversation thread, or delete the `.db` file to start completely fresh.
+- **Gemini free tier limits.** The free Gemini API has rate limits. For heavy usage, consider the paid tier or switch to another provider via `LLM_PROVIDER`.
+- **Portfolio data is local.** Your holdings live in SQLite (`portfolio.db`) on your machine. Nothing is sent anywhere except stock symbols to Yahoo Finance and conversation text to your LLM provider.
 
 ## License
 
-MIT License - feel free to use this code for educational and development purposes.
+MIT — use it, learn from it, build on it.
